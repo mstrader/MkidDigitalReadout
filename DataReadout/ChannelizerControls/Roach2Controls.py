@@ -254,7 +254,7 @@ class Roach2Controls:
             
             
             #interweave the values such that we have two samples from freq 0 (row 0), two samples from freq 1, ... to freq 256. Then have the next two samples from freq 1 ...
-            freqPad = np.zeros((self.params['nChannelsPerStream'] - len(toneDict['quantizedFreqList']),nDdsSamples))
+            freqPad = np.zeros((self.params['nChannelsPerStream'] - len(toneDict['quantizedFreqList']),nDdsSamples),dtype=np.int)
             #First pad with missing resonators
             if len(iValList) >0:
                 iValList = np.append(iValList,freqPad,0)    
@@ -311,9 +311,9 @@ class Roach2Controls:
         allMemVals=[]
         for iMem in range(len(memNames)):
             iVals,qVals = ddsToneDict['iStreamList'][iMem],ddsToneDict['qStreamList'][iMem]
-            memVals = self.formatWaveForMem(iVals,qVals,self.params['nBitsPerDdsSamplePair'],
-                                            self.params['nDdsSamplesPerCycle'],len(memNames),
-                                            self.params['nBytesPerQdrSample']*8,earlierSampleIsMsb=True)
+            memVals = self.formatWaveForMem(iVals,qVals,nBitsPerSamplePair=self.params['nBitsPerDdsSamplePair'],
+                                            nSamplesPerCycle=self.params['nDdsSamplesPerCycle'],nMems=len(memNames),
+                                            nBitsPerMemRow=self.params['nBytesPerQdrSample']*8,earlierSampleIsMsb=True)
             time.sleep(.1)
             allMemVals.append(memVals)
             
@@ -389,7 +389,8 @@ class Roach2Controls:
     
     def loadDacLUT(self, combDict=None):
         """
-        Load frequency comb in DAC look up tables
+        Sends frequency comb to V7 over UART, where it is loaded 
+        into a lookup table
         
         Call generateDacComb() first
         
@@ -471,15 +472,22 @@ class Roach2Controls:
         self.LOFreq = LOFreq
     
     def loadLOFreq(self,LOFreq=None):
+        """
+        Send LO frequency to V7 over UART.
+        Must initialize LO first.
+        
+        INPUTS:
+            LOFreq - LO frequency in MHz
+        
+        Sends LO freq one byte at a time, LSB first
+           sends integer bytes first, then fractional
+        """
         if LOFreq is None:
             LOFreq = self.LOFreq
+       
         
-        # load into IF board
-        # sends LO freq one byte at a time, LSB first
-        #   sends integer bytes first, then fractional
-        
-        loFreqInt = int(self.LOFreq)
-        loFreqFrac = self.LOFreq - loFreqInt
+        loFreqInt = int(LOFreq)
+        loFreqFrac = LOFreq - loFreqInt
         
         # Put V7 into LO recv mode
         while(not(self.v7_ready)):
@@ -493,7 +501,7 @@ class Roach2Controls:
         self.fpga.write_int(self.params['txEnUARTReg'],0)        
         
         for i in range(2):
-            transferByte = loFreqInt>>(i*8)|255 #takes an 8-bit "slice" of loFreqInt
+            transferByte = (loFreqInt>>(i*8))&255 #takes an 8-bit "slice" of loFreqInt
             
             while(not(self.v7_ready)):
                 self.v7_ready = self.fpga.read_int(self.params['v7ReadyReg'])
@@ -505,11 +513,13 @@ class Roach2Controls:
             time.sleep(0.01)
             self.fpga.write_int(self.params['txEnUARTReg'],0)
         
+        print 'loFreqFrac' + str(loFreqFrac)	
         loFreqFrac = int(loFreqFrac*(2**16))
+        print 'loFreqFrac' + str(loFreqFrac)
         
         # same as transfer of int bytes
         for i in range(2):
-            tranferByte = loFreqFrac>>(i*8)|255
+            transferByte = (loFreqFrac>>(i*8))&255
             
             while(not(self.v7_ready)):
                 self.v7_ready = self.fpga.read_int(self.params['v7ReadyReg'])
@@ -520,6 +530,38 @@ class Roach2Controls:
             self.fpga.write_int(self.params['txEnUARTReg'],1)
             time.sleep(0.01)
             self.fpga.write_int(self.params['txEnUARTReg'],0)
+            
+    def changeAtten(self, attenID, attenVal):
+        """
+        Change the attenuation on IF Board attenuators
+        Must initialize attenuator SPI connection first
+        INPUTS:
+            attenID 
+                1 - RF Upcoverter path
+                2 - RF Upconverter path
+                3 - RF Downconverter path
+                
+        Attenuation must be a multiple of 0.25 dB
+        """
+        attenVal = int(attenVal*4) #attenVal register holds value 4x(attenuation)
+        
+        while(not(self.v7_ready)):
+            self.v7_ready = self.fpga.read_int(self.params['v7ReadyReg'])
+            
+        self.v7_ready = 0
+        sendUARTCommand(self, self.params['mbChangeAtten'])
+        
+        while(not(self.v7_ready)):
+            self.v7_ready = self.fpga.read_int(self.params['v7ReadyReg'])
+            
+        self.v7_ready = 0
+        sendUARTCommand(self, attenID)
+        
+        while(not(self.v7_ready)):
+            self.v7_ready = self.fpga.read_int(self.params['v7ReadyReg'])
+            
+        self.v7_ready = 0
+        sendUARTCommand(self, attenVal)
     
     def generateDacComb(self, freqList=None, resAttenList=None, globalDacAtten = 0, phaseList=None, dacScaleFactor=None):
         """
@@ -743,6 +785,8 @@ class Roach2Controls:
             freqList = freqList[:self.params['nChannels']]
         self.freqList = np.ravel(freqList)
         self.freqChannels = self.freqList
+        if self.verbose:
+            print 'Generating Resonator Channels...'
         
         #Pad with freq = -1 so that freqChannels's length is a multiple of nStreams
         nStreams = int(self.params['nChannels']/self.params['nChannelsPerStream'])        #number of processing streams. For Gen 2 readout this should be 4
@@ -757,6 +801,11 @@ class Roach2Controls:
         
         #Split up to assign channel numbers
         self.freqChannels = np.reshape(self.freqChannels,(-1,nStreams),order)
+        
+        if self.verbose:
+            print '\tFreq Channels: ',self.freqChannels
+            print '...Done!'
+        
         return self.freqChannels
         
         
@@ -781,6 +830,8 @@ class Roach2Controls:
                 print "Run generateResonatorChannels() first!"
                 raise
         freqChannels = np.asarray(freqChannels)
+        if self.verbose:
+            print "Finding FFT Bins..."
         
         #The frequencies seen by the fft block are actually from the DAC, up/down converted by the IF board, and then digitized by the ADC
         dacFreqChannels = (freqChannels-self.LOFreq)
@@ -795,6 +846,10 @@ class Roach2Controls:
         self.fftBinIndChannels[np.where(freqChannels<0)]=self.fftBinPadValue      # empty channels have freq=-1. Assign this to fftBin=0
         
         self.fftBinIndChannels = self.fftBinIndChannels.astype(np.int)
+        
+        if self.verbose:
+            print '\tfft bin indices: ',self.fftBinIndChannels
+            print '...Done!'
         return self.fftBinIndChannels
 
         
@@ -915,6 +970,20 @@ class Roach2Controls:
 
         sock.close()
         dumpFile.close()
+
+    def sendUARTCommand(self, inByte):
+        """
+        Sends a single byte to V7 over UART
+        Doesn't wait for a v7_ready signal
+        Inputs:
+            inByte - byte to send over UART
+        """
+        self.fpga.write_int(self.params['inByteUARTReg'],inByte)
+        time.sleep(0.01)
+        self.fpga.write_int(self.params['txEnUARTReg'],1)
+        time.sleep(0.01)
+        self.fpga.write_int(self.params['txEnUARTReg'],0)        
+
 if __name__=='__main__':
     if len(sys.argv) > 1:
         ip = sys.argv[1]
@@ -935,13 +1004,13 @@ if __name__=='__main__':
     freqList = np.arange(loFreq-nFreqs/2.*spacing,loFreq+nFreqs/2.*spacing,spacing)
     freqList+=np.random.uniform(-spacing,spacing,nFreqs)
     freqList = np.sort(freqList)
-    #attenList = np.random.randint(23,33,nFreqs)
+    attenList = np.random.randint(23,33,nFreqs)
     
-    freqList=np.asarray([5.2498416321e9, 5.125256256e9, 4.852323456e9, 4.69687416351e9])#,4.547846e9])
-    attenList=np.asarray([1,2,3,5])#,6])
+    #freqList=np.asarray([5.2498416321e9, 5.125256256e9, 4.852323456e9, 4.69687416351e9])#,4.547846e9])
+    #attenList=np.asarray([1,2,3,5])#,6])
     
-    #freqList=np.asarray([5.12512345e9])
-    #attenList=np.asarray([0])
+    freqList=np.asarray([5.12512345e9])
+    attenList=np.asarray([0])
     
     #attenList = attenList[np.where(freqList > loFreq)]
     #freqList = freqList[np.where(freqList > loFreq)]
@@ -954,7 +1023,7 @@ if __name__=='__main__':
     roach_0.generateDdsTones()
     
     #roach_0.loadDdsLUT()
-    #roach_0.loadChanSelection()
+    roach_0.loadChanSelection()
     #roach_0.initializeV7UART()
     #roach_0.loadDacLUT()
     
